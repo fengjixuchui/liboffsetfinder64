@@ -41,17 +41,24 @@ namespace tihmstar{
                 b,
                 nop,
                 and_,
-                csel
+                csel,
+                mov,
+                mrs,
+                subs,
+                cmp = subs,
+                ccmp
             };
             enum subtype{
                 st_general,
                 st_register,
+                st_register_extended,
                 st_immediate,
                 st_literal
             };
             enum supertype{
                 sut_general,
-                sut_branch_imm
+                sut_branch_imm,
+                sut_memory //load or store
             };
             enum cond{
                 NE = 000,
@@ -70,14 +77,17 @@ namespace tihmstar{
                 LE = 110,
                 AL = 111
             };
+            enum systemreg : uint64_t{
+                tpidr_el1 = 0x4684
+            };
             
         private:
             uint32_t _opcode;
             uint64_t _pc;
+            type _type;
             
         public:
             insn(uint32_t opcode, uint64_t pc);
-            insn(loc_t pc, type t, subtype subt, int64_t imm, uint8_t rd, uint8_t rn, uint8_t rt, uint8_t other);
             
         public: //static type determinition
             static bool is_adrp(uint32_t i);
@@ -100,10 +110,14 @@ namespace tihmstar{
             static bool is_str(uint32_t i);
             static bool is_stp(uint32_t i);
             static bool is_movz(uint32_t i);
+            static bool is_mov(uint32_t i);
             static bool is_bcond(uint32_t i);
             static bool is_b(uint32_t i);
             static bool is_nop(uint32_t i);
             static bool is_csel(uint32_t i);
+            static bool is_mrs(uint32_t i);
+            static bool is_subs(uint32_t i);
+            static bool is_ccmp(uint32_t i);
 
         public:
             uint32_t opcode();
@@ -116,14 +130,32 @@ namespace tihmstar{
             uint8_t rd();
             uint8_t rn();
             uint8_t rt();
-            uint8_t other();
-        
+            uint8_t rt2();
+            uint8_t rm();
+            cond condition();
+            uint64_t special();
+            
         public: //cast operators
             operator enum type();
             operator loc_t();
+            
+              
+        public: //constructor functions
+            static insn new_general_adr(loc_t pc, int64_t imm, uint8_t rd);
+
+            static insn new_register_mov(loc_t pc, int64_t imm, uint8_t rd, uint8_t rn, uint8_t rm);
+            static insn new_register_ccmp(loc_t pc, cond condition, uint8_t flags, uint8_t rn, uint8_t rm);
+
+            static insn new_immediatel_bl(loc_t pc, int64_t imm);
+            static insn new_immediatel_b(loc_t pc, int64_t imm);
+            static insn new_immediatel_movz(loc_t pc, int64_t imm, uint8_t rd, uint8_t rm);
+            static insn new_immediatel_movk(loc_t pc, int64_t imm, uint8_t rd, uint8_t rm);
         };
     };
 };
+
+
+
 
 
 #endif /* insn_hpp */

@@ -36,9 +36,14 @@ bool vsegment::isInRange(loc_t p){
     return (p - _vaddr) < _size;
 }
 
-loc_t vsegment::memmem(const void *little, size_t little_len){
+loc_t vsegment::memmem(const void *little, size_t little_len, loc_t startLoc){
     loc_t rt = 0;
-    if ((rt = (loc_t)::memmem(_buf, _size, little, little_len))) {
+    offset_t startOffset = 0;
+    if (startLoc) {
+        startOffset = startLoc - _vaddr;
+        assure(startOffset < _size);
+    }
+    if ((rt = (loc_t)::memmem(_buf+startOffset, _size-startOffset, little, little_len))) {
         rt = rt - (loc_t)_buf + _vaddr;
     }
     return rt;
@@ -96,12 +101,18 @@ vsegment &vsegment::operator=(loc_t p){
 }
 
 #pragma mark deref operator
+                    
+const void *vsegment::memoryForLoc(loc_t loc){
+    assure(isInRange(loc));
+    return loc - _vaddr + _buf;
+}
 
-uint64_t vsegment::pc(){
+
+uint64_t vsegment::pc() const{
     return (uint64_t)(_vaddr+_curpos);
 }
 
-uint32_t vsegment::value(loc_t p){
+uint32_t vsegment::value(loc_t p) const{
     offset_t off = (p - _vaddr);
     customassure(off < _size, out_of_range); //check for off being at least 1 byte
     if (off <= _size-4) {
@@ -117,7 +128,7 @@ uint32_t vsegment::value(loc_t p){
     return ret;
 }
 
-uint64_t vsegment::doublevalue(loc_t p){
+uint64_t vsegment::doublevalue(loc_t p) const{
     offset_t off = (p - _vaddr);
     customassure(off < _size, out_of_range); //check for off being at least 1 byte
     if (off <= _size-8) {
@@ -133,11 +144,11 @@ uint64_t vsegment::doublevalue(loc_t p){
     return ret;
 }
 
-uint32_t vsegment::value(){
+uint32_t vsegment::value() const{
     return *(uint32_t*)(_buf+_curpos);
 }
 
-uint64_t vsegment::doublevalue(){
+uint64_t vsegment::doublevalue() const{
     if (_curpos <= _size-8) {
         return *(uint64_t*)(_buf+_curpos);
     }
@@ -154,6 +165,6 @@ insn vsegment::operator()(){
     return ::insn(value(),pc());
 }
 
-vsegment::operator loc_t(){
+vsegment::operator loc_t() const{
     return (loc_t)pc();
 }

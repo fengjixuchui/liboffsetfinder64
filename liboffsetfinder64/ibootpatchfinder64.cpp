@@ -106,7 +106,7 @@ std::vector<patch> ibootpatchfinder64::get_sigcheck_patch(){
     loc_t f1top = find_bof(img4strref);
     debug("f1top=%p\n",f1top);
 
-    loc_t f1topref = find_branch_ref(f1top,1);
+    loc_t f1topref = find_call_ref(f1top,1);
     debug("f1topref=%p\n",f1topref);
 
     loc_t f2top = find_bof(f1topref);
@@ -180,8 +180,13 @@ std::vector<patch> ibootpatchfinder64::get_boot_arg_patch(const char *bootargs){
         debug("Pointing default boot-args xref to %p...\n", cert_str_loc);
 
         default_boot_args_str_loc = cert_str_loc;
+        
+        vmem iter(*_vmem,default_boot_args_xref);
+        
+        assure(iter() == insn::adr);
 
-        insn pins(default_boot_args_xref, insn::adr, insn::st_general, (int64_t)default_boot_args_str_loc, 9, 0, 0, 0);
+        insn pins = insn::new_general_adr(default_boot_args_xref, (int64_t)default_boot_args_str_loc, iter().rd());
+        
         uint32_t opcode = pins.opcode();
         patches.push_back({(loc_t)pins.pc(), &opcode, 4});
     }
@@ -199,13 +204,13 @@ std::vector<patch> ibootpatchfinder64::get_boot_arg_patch(const char *bootargs){
     insn csel = iter();
     debug("csel=%p\n", (loc_t)csel.pc());
 
-    assure(xrefRD == csel.rn() || xrefRD == csel.other());
+    assure(xrefRD == csel.rn() || xrefRD == csel.rm());
     
     debug("cselrd=%d\n",csel.rd());
+        
+    insn pmov = insn::new_register_mov(iter, 0, csel.rd(), -1, xrefRD);
     
-    insn pmov(iter(), insn::movz, insn::st_register, 0, csel.rd(), -1, 0, xrefRD);
-    
-    debug("(%p)patching: \"mov x%d, x%d\"\n",(loc_t)pmov.pc(),pmov.rd(),pmov.other());
+    debug("(%p)patching: \"mov x%d, x%d\"\n",(loc_t)pmov.pc(),pmov.rd(),pmov.rm());
     uint32_t opcode = pmov.opcode();
     patches.push_back({(loc_t)pmov.pc(), &opcode, 4});
 
@@ -221,8 +226,9 @@ std::vector<patch> ibootpatchfinder64::get_boot_arg_patch(const char *bootargs){
     if (iter() != insn::adr) {
         while (++iter != insn::adr);
     }
-
-    insn pins(iter, insn::adr, insn::st_general, (int64_t)default_boot_args_str_loc, iter().rd(), 0, 0, 0);
+    
+    insn pins = insn::new_general_adr(iter, (int64_t)default_boot_args_str_loc, iter().rd());
+    
     opcode = pins.opcode();
     patches.push_back({(loc_t)pins.pc(), &opcode, 4});
     debug("(%p)patching: \"adr x%d, 0x%llx\"\n",(loc_t)pins.pc(),pins.rd(),pins.imm());
@@ -392,13 +398,13 @@ std::vector<patch> ibootpatchfinder64::get_freshnonce_patch(){
     loc_t noncefun1 = find_bof(noncevar_ref);
     debug("noncefun1=%p\n",noncefun1);
 
-    loc_t noncefun1_blref = find_branch_ref(noncefun1);
+    loc_t noncefun1_blref = find_call_ref(noncefun1);
     debug("noncefun1_blref=%p\n",noncefun1_blref);
 
     loc_t noncefun2 = find_bof(noncefun1_blref);
     debug("noncefun2=%p\n",noncefun2);
 
-    loc_t noncefun2_blref = find_branch_ref(noncefun2);
+    loc_t noncefun2_blref = find_call_ref(noncefun2);
     debug("noncefun2_blref=%p\n",noncefun2_blref);
 
     vmem iter(*_vmem,noncefun2_blref);
@@ -409,5 +415,212 @@ std::vector<patch> ibootpatchfinder64::get_freshnonce_patch(){
     debug("branchloc=%p\n",branchloc);
 
     patches.push_back({branchloc,"\x1F\x20\x03\xD5"/*nop*/,4});
+    return patches;
+}
+
+std::vector<patch> ibootpatchfinder64::get_readback_loadaddr_patch(){
+    std::vector<patch> patches;
+
+    loc_t cmd_results_str = findstr("cmd-results", true);
+    debug("cmd_results_str=%p\n",cmd_results_str);
+
+    loc_t cmd_results_ref = find_literal_ref(cmd_results_str);
+    debug("cmd_results_ref=%p\n",cmd_results_ref);
+
+    loc_t loadaddr_str = findstr("loadaddr", true);
+    debug("loadaddr_str=%p\n",loadaddr_str);
+
+    loc_t file_size_str = findstr("filesize", true);
+    debug("file_size_str=%p\n",file_size_str);
+    
+    
+    loc_t file_size_ref = find_literal_ref(file_size_str);
+    debug("file_size_ref=%p\n",file_size_ref);
+    
+    vmem iter(*_vmem,file_size_ref);
+
+    while (++iter != insn::bl);
+    
+    loc_t getenv_int_func = iter().imm();
+    debug("getenv_int_func=%p\n",getenv_int_func);
+
+
+    debug("Pointing cmd_results_ref to %p...\n", loadaddr_str);
+    {
+        insn pins = insn::new_general_adr(cmd_results_ref, (int64_t)loadaddr_str, 0);
+        uint32_t opcode = pins.opcode();
+        patches.push_back({(loc_t)pins.pc(), &opcode, 4});
+    }
+
+    iter = cmd_results_ref;
+
+    while (++iter != insn::bl);
+
+    {
+        debug("replacing getenv func with getenvint func at=%p\n",(loc_t)iter);
+        insn pins = insn::new_immediatel_bl(iter, (int64_t)getenv_int_func);
+        uint32_t opcode = pins.opcode();
+        patches.push_back({(loc_t)pins.pc(), &opcode, 4});
+    }
+
+    ++iter;
+    ++iter;
+
+    debug("Loading file_size_str to x0\n");
+    loc_t loadArgLoc = iter;
+    debug("loadArgLoc=%p\n",loadArgLoc);
+    {
+        insn pins = insn::new_general_adr(loadArgLoc, (int64_t)file_size_str, 0);
+        uint32_t opcode = pins.opcode();
+        patches.push_back({(loc_t)pins.pc(), &opcode, 4});
+    }
+
+    debug("Calling getenv\n");
+    ++iter;
+    loc_t callGentenvLoc = iter;
+    debug("callGentenvLoc=%p\n",callGentenvLoc);
+    {
+        insn pins = insn::new_immediatel_bl(callGentenvLoc, (int64_t)getenv_int_func);
+        uint32_t opcode = pins.opcode();
+        patches.push_back({(loc_t)pins.pc(), &opcode, 4});
+    }
+    
+    while (++iter != insn::bl);
+    
+    loc_t strlenloc = iter;
+    debug("strlenloc=%p\n",strlenloc);
+    patches.push_back({strlenloc,"\xE1\x03\x00\xAA"/*mov x1, x0*/"\x1F\x20\x03\xD5"/*nop*/,8});
+    return patches;
+}
+
+
+std::vector<patch> ibootpatchfinder64::get_memload_patch(){
+    std::vector<patch> patches;
+    
+    loc_t loadaddr_str = findstr("loadaddr", true);
+    debug("loadaddr_str=%p\n",loadaddr_str);
+
+    loc_t memboot_str = findstr("memboot", true);
+    debug("memboot_str=%p\n",memboot_str);
+
+    debug("renaming memboot to memload\n");
+    patches.push_back({memboot_str,"memload",strlen("memload")});
+
+    loc_t memboot_table_ptr = _vmem->memmem(&memboot_str, sizeof(memboot_str));
+    debug("memboot_table_ptr=%p\n",memboot_table_ptr);
+
+    memboot_table_ptr+=8;
+    
+    loc_t memboot_fuc = _vmem->deref(memboot_table_ptr);
+    debug("memboot_fuc=%p\n",memboot_fuc);
+
+    vmem iter(*_vmem,memboot_fuc);
+
+    while (++iter != insn::bl);
+    
+    loc_t firstBL = iter;
+    debug("firstBL=%p\n",firstBL);
+    
+    loc_t getenv_func = iter().imm();
+    debug("getenv_func=%p\n",getenv_func);
+
+    while (++iter != insn::cbz);
+
+    loc_t fistCBZ = iter;
+    debug("fistCBZ=%p\n",fistCBZ);
+    
+    loc_t cbzdst = iter().imm();
+    debug("cbzdst=%p\n",cbzdst);
+
+    
+    loc_t err_loading_ramdisk_str = findstr("error loading ramdisk\n", true);
+    debug("err_loading_ramdisk_str=%p\n",err_loading_ramdisk_str);
+
+    loc_t err_loading_ramdisk_ref = find_literal_ref(err_loading_ramdisk_str);
+    debug("err_loading_ramdisk_ref=%p\n",err_loading_ramdisk_ref);
+
+    
+    loc_t bsrc = find_branch_ref(err_loading_ramdisk_ref, -0x200);
+    debug("bsrc=%p\n",bsrc);
+
+    iter = bsrc;
+    
+    while (--iter != insn::bl);
+    
+    loc_t load_ramdisk_func = iter().imm();
+    debug("load_ramdisk_func=%p\n",load_ramdisk_func);
+
+    iter = load_ramdisk_func;
+    do{
+        while (++iter != insn::bl);
+    }while (find_register_value(iter,3) != 'rdsk');
+    
+    loc_t loadimg_func = iter().imm();
+    debug("loadimg_func=%p\n",loadimg_func);
+
+    
+    iter = firstBL;
+    ++iter;
+    
+    uint8_t backupreg = iter().rd();
+    debug("filesize reg=%u\n",backupreg);
+    ++iter;
+    
+    {
+        debug("arg0 = loadaddr\n");
+        insn pins = insn::new_general_adr(iter, (int64_t)loadaddr_str, 0);
+        uint32_t opcode = pins.opcode();
+        patches.push_back({(loc_t)pins.pc(), &opcode, 4});
+    }
+    ++iter;
+    {
+        debug("call getenv(loadaddr)\n");
+        insn pins = insn::new_immediatel_bl(iter, (int64_t)getenv_func);
+        uint32_t opcode = pins.opcode();
+        patches.push_back({(loc_t)pins.pc(), &opcode, 4});
+    }
+    ++iter;
+    {
+        debug("x1 = filesize_val\n");
+        insn pins = insn::new_register_mov(iter, 0, 1, -1, backupreg);
+        uint32_t opcode = pins.opcode();
+        patches.push_back({(loc_t)pins.pc(), &opcode, 4});
+    }
+    ++iter;
+    debug("x2 = 'ibot'\n");
+    {
+       debug("  x2 = '  ot'\n");
+       insn pins = insn::new_immediatel_movz(iter, 'ibot' & 0xffff, 2, 0);
+       uint32_t opcode = pins.opcode();
+       patches.push_back({(loc_t)pins.pc(), &opcode, 4});
+    }
+    ++iter;
+    {
+       debug("  x2 |= 'ib  '\n");
+       insn pins = insn::new_immediatel_movk(iter, ('ibot'>>16) & 0xffff, 2, 1);
+       uint32_t opcode = pins.opcode();
+       patches.push_back({(loc_t)pins.pc(), &opcode, 4});
+    }
+    ++iter;
+    {
+       debug("x3 = 0\n");
+       insn pins = insn::new_immediatel_movz(iter, 0, 3, 0);
+       uint32_t opcode = pins.opcode();
+       patches.push_back({(loc_t)pins.pc(), &opcode, 4});
+    }
+    ++iter;
+    {
+       debug("call load image\n");
+       insn pins = insn::new_immediatel_bl(iter, (int64_t)loadimg_func);
+       uint32_t opcode = pins.opcode();
+       patches.push_back({(loc_t)pins.pc(), &opcode, 4});
+    }
+//    ++iter;
+//    {
+//       debug("jump exit\n");
+//       insn pins(iter, insn::b, insn::st_immediate, cbzdst, 0, 0, 0, 0);
+//       uint32_t opcode = pins.opcode();
+//       patches.push_back({(loc_t)pins.pc(), &opcode, 4});
+//    }
     return patches;
 }

@@ -14,11 +14,27 @@ using namespace std;
 using namespace tihmstar::offsetfinder64;
 typedef uint64_t kptr_t;
 
+
 int main(int argc, const char * argv[]) {
     
-    ibootpatchfinder64 ibp(argv[1]);
+//    ibootpatchfinder64 ibp(argv[1]);
+//
+//    auto patches = ibp.get_memload_patch();
+//
+//    for (auto p : patches) {
+//        printf("iBEC: Applying patch=%p : ",(void*)p._location);
+//        for (int i=0; i<p._patchSize; i++) {
+//            printf("%02x",((uint8_t*)p._patch)[i]);
+//        }
+//        printf("\n");
+//    }
+  
     
-    ibp.get_freshnonce_patch();
+    kernelpatchfinder64 kpf(argv[1]);
+    
+    auto patches = kpf.get_disable_codesigning_patch();
+    
+    
     
     
     printf("done\n");

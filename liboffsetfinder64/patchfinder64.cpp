@@ -40,8 +40,13 @@ patchfinder64::~patchfinder64(){
 
 #pragma mark patchfinder
 
-loc_t patchfinder64::findstr(std::string str, bool hasNullTerminator){
-    return _vmem->memmem(str.c_str(), str.size()+(hasNullTerminator));
+const void *patchfinder64::memoryForLoc(loc_t loc){
+    return _vmem->memoryForLoc(loc);
+}
+
+
+loc_t patchfinder64::findstr(std::string str, bool hasNullTerminator, loc_t startAddr){
+    return _vmem->memmem(str.c_str(), str.size()+(hasNullTerminator), startAddr);
 }
 
 loc_t patchfinder64::find_bof(loc_t pos){
@@ -49,7 +54,7 @@ loc_t patchfinder64::find_bof(loc_t pos){
 
 
     //find stp x29, x30, [sp, ...]
-    while (functop() != insn::stp || functop().other() != 30 || functop().rn() != 31) --functop;
+    while (functop() != insn::stp || functop().rt2() != 30 || functop().rn() != 31) --functop;
 
     try {
         //if there are more stp before, then this wasn't functop
@@ -82,7 +87,6 @@ uint64_t patchfinder64::find_register_value(loc_t where, int reg, loc_t startAdd
     uint64_t value[32] = {0};
     
     for (;(loc_t)functop.pc() < where;++functop) {
-        
         switch (functop().type()) {
             case offsetfinder64::insn::adrp:
                 value[functop().rd()] = functop().imm();
@@ -100,6 +104,15 @@ uint64_t patchfinder64::find_register_value(loc_t where, int reg, loc_t startAdd
                 //                printf("%p: LDR X%d, [X%d, 0x%llx]\n", (void*)functop.pc(), functop.rt(), functop.rn(), (uint64_t)functop.imm());
                 value[functop().rt()] = value[functop().rn()] + functop().imm(); // XXX address, not actual value
                 break;
+            case offsetfinder64::insn::movz:
+                value[functop().rd()] = functop().imm();
+                break;
+            case offsetfinder64::insn::movk:
+                value[functop().rd()] |= functop().imm();
+                break;
+            case offsetfinder64::insn::mov:
+                value[functop().rd()] = value[functop().rm()];
+                break;
             default:
                 break;
         }
@@ -110,33 +123,45 @@ uint64_t patchfinder64::find_register_value(loc_t where, int reg, loc_t startAdd
 loc_t patchfinder64::find_literal_ref(loc_t pos, int ignoreTimes){
     vmem adrp(*_vmem);
     
-    uint8_t rd = 0xff;
-    uint64_t imm = 0;
-    
     try {
         for (;;++adrp){
             if (adrp() == insn::adr) {
                 if (adrp().imm() == (uint64_t)pos){
                     if (ignoreTimes) {
                         ignoreTimes--;
-                        rd = 0xff;
-                        imm = 0;
                         continue;
                     }
                     return (loc_t)adrp.pc();
                 }
-            }else if (adrp() == insn::adrp) {
+            }
+            
+            if (adrp() == insn::adrp) {
+                uint8_t rd = 0xff;
+                uint64_t imm = 0;
                 rd = adrp().rd();
                 imm = adrp().imm();
-            }else if (adrp() == insn::add && rd == adrp().rd()){
-                if (imm + adrp().imm() == (int64_t)pos){
-                    if (ignoreTimes) {
-                        ignoreTimes--;
-                        rd = 0xff;
-                        imm = 0;
-                        continue;
+                
+                vmem iter(*_vmem,adrp);
+
+                for (int i=0; i<10; i++) {
+                    ++iter;
+                    if (iter() == insn::add && rd == iter().rd()){
+                        if (imm + iter().imm() == (int64_t)pos){
+                            if (ignoreTimes) {
+                                ignoreTimes--;
+                                break;
+                            }
+                            return (loc_t)iter.pc();
+                        }
+                    }else if (iter().supertype() == insn::sut_memory && iter().subtype() == insn::st_immediate && rd == iter().rn()){
+                        if (imm + iter().imm() == (int64_t)pos){
+                            if (ignoreTimes) {
+                                ignoreTimes--;
+                                break;
+                            }
+                            return (loc_t)iter.pc();
+                        }
                     }
-                    return (loc_t)adrp.pc();
                 }
             }
         }
@@ -146,22 +171,46 @@ loc_t patchfinder64::find_literal_ref(loc_t pos, int ignoreTimes){
     return 0;
 }
 
-loc_t patchfinder64::find_branch_ref(loc_t pos, int ignoreTimes){
+loc_t patchfinder64::find_call_ref(loc_t pos, int ignoreTimes){
     vmem bl(*_vmem);
-    try {
-        if (bl() == insn::bl) goto isBL;
-        while (true){
-            while (++bl != insn::bl);
-        isBL:
-            if (bl().imm() == (uint64_t)pos && --ignoreTimes <0)
-                return bl;
-        }
-    } catch (tihmstar::out_of_range &e) {
-        return 0;
+    if (bl() == insn::bl) goto isBL;
+    while (true){
+        while (++bl != insn::bl);
+    isBL:
+        if (bl().imm() == (uint64_t)pos && --ignoreTimes <0)
+            return bl;
     }
-    return 0;
+    reterror("call reference not found");
 }
 
 
+loc_t patchfinder64::find_branch_ref(loc_t pos, int limit, int ignoreTimes){
+    vmem brnch(*_vmem, pos);
+
+    if (limit < 0 ) {
+        while (true) {
+            while ((--brnch).supertype() != insn::supertype::sut_branch_imm){
+                limit +=4;
+                retassure(limit < 0, "search limit reached");
+            }
+            if (brnch().imm() == pos){
+                if (ignoreTimes--  <=0)
+                    return brnch;
+            }
+        }
+    }else{
+        while (true) {
+           while ((++brnch).supertype() != insn::supertype::sut_branch_imm){
+               limit -=4;
+               retassure(limit > 0, "search limit reached");
+           }
+           if (brnch().imm() == pos){
+               if (ignoreTimes--  <=0)
+                   return brnch;
+           }
+        }
+    }
+    reterror("branchref not found");
+}
 
 //

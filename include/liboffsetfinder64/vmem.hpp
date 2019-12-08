@@ -28,9 +28,9 @@ namespace tihmstar{
             offsetfinder64::vsegment seg(loc_t pos);
             
             uint64_t deref(offsetfinder64::loc_t pos);
-            offsetfinder64::loc_t memmem(const void *little, size_t little_len);
+            offsetfinder64::loc_t memmem(const void *little, size_t little_len, loc_t startLoc = 0);
             offsetfinder64::loc_t memstr(const char *little);
-            bool isInRange(loc_t pos);
+            bool isInRange(loc_t pos) noexcept;
 
             /*--segment functions but for vmem--*/
             //iterator operator
@@ -45,7 +45,10 @@ namespace tihmstar{
             //segment info functions
             int curPerm() const;
             offsetfinder64::vsegment curSeg();
+            const offsetfinder64::vsegment curSeg() const;
+            const void *memoryForLoc(loc_t loc);
 
+            
             //deref operator
             uint64_t pc();
             uint32_t value(loc_t p); //arbitrary pos
@@ -56,7 +59,7 @@ namespace tihmstar{
             //insn operator
             insn getinsn();
             insn operator()();
-            operator loc_t();
+            operator loc_t() const;
         };
         
     };
