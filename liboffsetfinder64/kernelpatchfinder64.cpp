@@ -6,13 +6,15 @@
 //  Copyright © 2019 tihmstar. All rights reserved.
 //
 
+#include <libinsn/vmem.hpp>
+
 #include "kernelpatchfinder64.hpp"
 #include "all_liboffsetfinder.hpp"
-
 
 using namespace std;
 using namespace tihmstar;
 using namespace offsetfinder64;
+using namespace libinsn;
 
 
 kernelpatchfinder64::kernelpatchfinder64(const char *filename)
@@ -27,16 +29,58 @@ kernelpatchfinder64::kernelpatchfinder64(const void *buffer, size_t bufSize)
     //
 }
 
-
 loc_t kernelpatchfinder64::find_syscall0(){
     constexpr char sig_syscall_3[] = "\x06\x00\x00\x00\x03\x00\x0c\x00";
     loc_t sys3 = _vmem->memmem(sig_syscall_3, sizeof(sig_syscall_3)-1);
     return sys3 - (3 * 0x18) + 0x8;
 }
 
+loc_t kernelpatchfinder64::find_machtrap_table(){
+    loc_t table = 0;
+    
+    vmem iter(*_vmem, 0, vsegment::kVMPROTNONE);
+    
+    for (;;iter.nextSeg()) {
+        vsegment cseg = iter.curSeg();
+        
+        if (cseg.size() < 10)
+            continue;
+        
+        uint8_t *beginptr = (uint8_t *)cseg.memoryForLoc(cseg.base());
+        uint8_t *endptr = (uint8_t *)cseg.memoryForLoc(cseg.base()+cseg.size()-1);
+        for (uint8_t *p = beginptr; p < endptr; p+=8) {
+            int onefailed = 0;
+            uint64_t *pp = (uint64_t*)p;
+            
+            if (!pp[0] || pp[1] || pp[2] || pp[3])
+                continue;
+            
+            for (int z=0; z<4; z++) {
+                if (memcmp(p, &p[z*4*8], 4*8)) {
+                    onefailed = 1;
+                    break;
+                }
+            }
+            if (onefailed)
+                continue;
+            table = p-beginptr + cseg.base();
+            goto foundpos;
+        }
+    }
+foundpos:
+    return table;
+}
+
+
 loc_t kernelpatchfinder64::find_function_for_syscall(int syscall){
     loc_t syscallTable = find_syscall0();
     loc_t tableEntry = (syscallTable + 3*(syscall-1)*sizeof(uint64_t));
+    return _vmem->deref(tableEntry);
+}
+
+loc_t kernelpatchfinder64::find_function_for_machtrap(int trapcall){
+    loc_t machtrapTable = find_machtrap_table();
+    loc_t tableEntry =machtrapTable + 4*8*trapcall;
     return _vmem->deref(tableEntry);
 }
 
@@ -98,15 +142,15 @@ std::vector<patch> kernelpatchfinder64::get_MarijuanARM_patch(){
     constexpr char marijuanarm[] = "MarijuanARM";
 
     loc_t strloc = -1;
-    while ((strloc = _vmem->memmem(release_arm, sizeof(release_arm)-1, strloc+1))) {
-        patches.push_back({strloc,marijuanarm,sizeof(marijuanarm)-1});
+    try {
+        while ((strloc = _vmem->memmem(release_arm, sizeof(release_arm)-1, strloc+1))) {
+            patches.push_back({strloc,marijuanarm,sizeof(marijuanarm)-1});
+        }
+    } catch (...) {
+        //
     }
 
     //everything is fine as long as we found at least one instance
-    /*
-     Note: this check is redundant, since the first time strloc is 0 so the whole space is searched
-        and an error is thrown if no occurence is found, but it feels bad to just assume that so there is another check here.
-     */
     retassure(patches.size(), "Not a single instance of %s was found",release_arm);
     
     return patches;
@@ -159,35 +203,59 @@ std::vector<patch> kernelpatchfinder64::get_task_conversion_eval_patch(){
         
         if (iter() == insn::mrs && iter().special() == insn::systemreg::tpidr_el1) {
             vmem iter2(iter,(loc_t)iter);
-            uint8_t regtpidr = iter().rt();
-            uint8_t regkernel_task = (uint8_t)-1;
-            loc_t kernel_task_val = 0;
-                        
-            for (int i=0; i<10; i++) {
+            int8_t regtpidr = iter().rt();
+            int8_t regThisTask = -1;
+                          
+            int cntCmp = 0;
+            
+            for (int i=0; i<100; i++) {
                 switch ((++iter2).type()) {
                     case insn::ldr:
-                        if (iter2().rt() == regkernel_task) {
-                            kernel_task_val += iter2().imm();
+                        if (iter2().rn() == regtpidr) {
+                            regThisTask = iter2().rt();
                         }
-                        break;
-                    case insn::adrp:
-                        kernel_task_val = iter2().imm();
-                        regkernel_task = iter2().rd();
                         break;
                     case insn::ccmp:
-                        if (iter2().special() == 0x4 &&
-                                ((regkernel_task == iter2().rm() && regtpidr == iter2().rn())
-                                 || (regtpidr == iter2().rm() && regkernel_task == iter2().rn()))
-                            ) {
+                        if (iter2().special() != 0x4) break;
+                        //intentionally fall through
+                    case insn::cmp:
+                        if (cntCmp > 0) cntCmp++;
+                        if (iter2().subtype() == insn::st_register) {
+                            int8_t regKernelTask = -1;
+                            if (iter2().rm() == regThisTask) {
+                                regKernelTask = iter2().rn();
+                            }else if (iter2().rn() == regThisTask){
+                                regKernelTask = iter2().rm();
+                            }else{
+                                break; //false alarm
+                            }
+                            if (cntCmp == 0) cntCmp++;
+
+                            loc_t bof = find_bof(iter2);
+                            if (bof > iter) { //sanity check
+                                //we cross function boundaries, probaly this is not what we are looking for
+                                break;
+                            }
                             
-                            loc_t ccmpPos = iter2;
-                            debug("%s: patchloc=%p\n",__FUNCTION__,(void*)ccmpPos);
-                            insn pins = insn::new_register_ccmp(iter2, iter2().condition(), iter2().special(), iter2().rn(), iter2().rn());
-                            uint32_t opcode = pins.opcode();
-                            patches.push_back({(loc_t)pins.pc(), &opcode, 4});
-                            goto loop_continue;
+                            uint64_t cmpVal = find_register_value(iter2, regKernelTask, iter);                            
+                            if (cmpVal == kernel_task && cntCmp == 2 && iter2() == insn::ccmp) {
+                                debug("%s: patchloc=%p\n",__FUNCTION__,(void*)(loc_t)iter2);
+                                insn pins = insn::new_register_ccmp(iter2, iter2().condition(), iter2().special(), iter2().rn(), iter2().rn());
+                                uint32_t opcode = pins.opcode();
+                                patches.push_back({(loc_t)pins.pc(), &opcode, 4});
+                                goto loop_continue;
+                            }
                         }
+                        break;
+                    case insn::ret:
+                        goto loop_continue;
                     default:
+                        try {
+                            if (iter2().rt() == regtpidr) regtpidr = -1;
+                            if (iter2().rt() == regThisTask) regThisTask = -1;
+                        } catch (...) {
+                            //
+                        }
                         break;
                 }
             }
@@ -199,12 +267,306 @@ std::vector<patch> kernelpatchfinder64::get_task_conversion_eval_patch(){
     return patches;
 }
 
-std::vector<patch> kernelpatchfinder64::get_disable_codesigning_patch(){
+std::vector<patch> kernelpatchfinder64::get_vm_fault_internal_patch(){
     std::vector<patch> patches;
+
+    loc_t str = _vmem->memstr("\"Write fault on compressor map, va: %p type: %u bounds: %p->%p");
+    debug("str=%p\n",str);
+
+    loc_t ref = find_literal_ref(str);
+    debug("ref=%p\n",ref);
+
     
-    reterror("todo implement");
+    vmem iter(*_vmem,ref);
+    
+    while (++iter != insn::cmp || iter().imm() != 6 || iter-1 != insn::and_);
+    ++iter;
+    
+    loc_t pos = iter;
+    debug("pos=%p\n",pos);
+
+    {
+        insn pins = insn::new_immediate_b(iter, iter().imm());
+        uint32_t opcode = pins.opcode();
+        patches.push_back({iter, &opcode, 4});
+    }
+
     return patches;
 }
+
+std::vector<patch> kernelpatchfinder64::get_trustcache_true_patch(){
+    std::vector<patch> patches;
+
+    vmem iter(*_vmem);
+
+
+    try {
+        for (int z=0;;z++) {
+inloop:
+            while (++iter != insn::madd);
+            vmem iter2(*_vmem,iter);
+            
+            for (int i=0; i<14; i++) {
+                if (++iter2 != insn::ldrb) goto inloop;
+                if (++iter2 != insn::ldrb) goto inloop;
+                if (++iter2 != insn::cmp) goto inloop;
+                if ((++iter2).supertype() != insn::sut_branch_imm) goto inloop;
+                if (++iter2 != insn::madd) goto inloop;
+            }
+            iter2 = vmem(*_vmem,iter);
+            --iter2;
+            if (--iter2 != insn::movz) goto inloop;
+
+            loc_t found = iter2;
+            debug("found=%p\n",found);
+            
+            constexpr char patch[] = "\x20\x00\x80\xD2\xC0\x03\x5F\xD6";
+            patches.push_back({found,patch,sizeof(patch)-1});
+        }
+    } catch (...) {
+        //
+    }
+
+    assure(patches.size()); //need at least one
+   
+    
+    return patches;
+}
+
+std::vector<patch> kernelpatchfinder64::get_mount_patch(){
+    std::vector<patch> patches;
+
+    loc_t mount = find_function_for_syscall(167);
+    mount |= 0xffffffUL << (6*8);
+    debug("mount=%p\n",mount);
+    
+    vmem iter(*_vmem,mount);
+    
+    while (++iter != insn::bl);
+    
+    loc_t mount_internal = iter().imm();
+    debug("mount_internal=%p\n",mount_internal);
+
+    
+    iter = mount_internal;
+    
+    while (++iter != insn::orr || iter().imm() != 0x10000);
+    
+    loc_t pos = iter;
+    debug("pos=%p\n",pos);
+
+
+    loc_t ref = find_branch_ref(pos, -0x100);
+    debug("ref=%p\n",ref);
+
+    iter = ref;
+    
+    while (--iter != insn::ldrb);
+    
+    {
+        debug("p1=%p\n",(loc_t)iter);
+        insn pins = insn::new_immediate_movz(iter, 0, iter().rn(), 0);
+        uint32_t opcode = pins.opcode();
+        patches.push_back({(loc_t)pins.pc(), &opcode, 4});
+    }
+    
+    while ((--iter != insn::tbz || iter().special() != 5) && (iter() != insn::tbnz || iter().special() != 5));
+
+    loc_t p2 = iter;
+    debug("p2=%p\n",p2);
+
+    if (iter() == insn::tbnz) {
+        patches.push_back({iter, "\x1F\x20\x03\xD5", 4});
+    }else{
+        insn pins = insn::new_immediate_b(iter, iter().imm());
+        uint32_t opcode = pins.opcode();
+        patches.push_back({(loc_t)pins.pc(), &opcode, 4});
+    }
+    
+    /* ---- allow mounting / as root ---- */
+
+    loc_t str = findstr("%s:%d: not allowed to mount as root\n", true);
+    debug("str=%p\n",str);
+
+    ref = find_literal_ref(str);
+    debug("ref=%p\n",ref);
+
+    iter = ref;
+    
+    while (--iter != insn::cmp);
+    
+    debug("p2=%p\n",(loc_t)iter);
+
+    patches.push_back({iter, "\x1F\x00\x00\xEB" /* cmp x0, x0 */, 4});
+    
+    return patches;
+}
+
+std::vector<patch> kernelpatchfinder64::get_tfp0_patch(){
+    std::vector<patch> patches;
+
+    loc_t get_task_for_pid = find_function_for_machtrap(45);
+    get_task_for_pid |= 0xffffUL << (8*6);
+    debug("get_task_for_pid=%p\n",get_task_for_pid);
+
+    vmem iter(*_vmem,get_task_for_pid);
+    
+    while (++iter != insn::cbz);
+    
+    loc_t p1 = iter;
+    debug("p1=%p\n",p1);
+
+    patches.push_back({p1,"\x1F\x20\x03\xD5",4});
+    
+    return patches;
+};
+
+std::vector<patch> kernelpatchfinder64::get_amfi_patch(bool doApplyPatch){
+    std::vector<patch> patches;
+    
+    loc_t amfi_str = findstr("AMFI: hook..execve() killing pid %u: %s\n", true);
+    debug("amfi_str=%p\n",amfi_str);
+
+    loc_t amfi_ref = find_literal_ref(amfi_str);
+    debug("amfi_ref=%p\n",amfi_ref);
+
+    vmem iter(*_vmem,amfi_ref);
+
+    while (++iter != insn::ret);
+    
+    loc_t amfi_eof = iter;
+    debug("amfi_eof=%p\n",amfi_eof);
+    
+    /*
+    ldr        x0, [sp, #0x8] 
+    ldr        w1, [x0]
+    orr        w1, w1, #0x4000000
+    orr        w1, w1, #0xf
+    and        w1, w1, #0xffffffffffffc0ff
+    str        w1, [x0]
+    mov        x0, xzr
+    ret
+     */
+    constexpr char patch[] = "\xE0\x07\x40\xF9\x01\x00\x40\xB9\x21\x00\x06\x32\x21\x0C\x00\x32\x21\x64\x12\x12\x01\x00\x00\xB9\xE0\x03\x1F\xAA\xC0\x03\x5F\xD6";
+    int pinscnt = (sizeof(patch)-1) / 4;
+    debug("pinscnt=%p\n",pinscnt);
+
+    loc_t shellcodePos = findnops(pinscnt, doApplyPatch);
+    debug("shellcodePos=%p\n",shellcodePos);
+
+    {
+        insn pins = insn::new_immediate_b(amfi_eof, shellcodePos);
+        uint32_t opcode = pins.opcode();
+        patches.push_back({(loc_t)pins.pc(), &opcode, 4});
+    }
+    
+    patches.push_back({shellcodePos,patch,sizeof(patch)-1});
+    
+    
+    /* ---- patch 2 ---- */
+    
+    loc_t amfi2_str = findstr("%s: Hash type is not SHA256 (%u) but %u.", true);
+    debug("amfi2_str=%p\n",amfi2_str);
+
+    loc_t amfi2_ref = find_literal_ref(amfi2_str);
+    debug("amfi2_ref=%p\n",amfi2_ref);
+
+    iter = amfi2_ref;
+    
+    while (--iter != insn::bl);
+    
+    while (++iter != insn::cmp);
+    
+    debug("p2=%p\n",(loc_t)iter);
+    patches.push_back({iter, "\x1F\x00\x00\x6B", 4});
+    
+    return patches;
+}
+
+
+std::vector<patch> kernelpatchfinder64::get_get_task_allow_patch(){
+    std::vector<patch> patches;
+
+    loc_t amif_str = findstr("AMFI: ", false);
+    debug("amfi_str=%p\n",amif_str);
+
+    
+    loc_t get_task_allow_str = findstr("get-task-allow", true, amif_str);
+    debug("get_task_allow_str=%p\n",get_task_allow_str);
+
+    loc_t get_task_allow_ref = 0;
+    loc_t find_func = 0;
+    
+    get_task_allow_ref = -4;
+    while (true) {
+        get_task_allow_ref = find_literal_ref(get_task_allow_str, 0, get_task_allow_ref+4);
+        debug("get_task_allow_ref=%p\n",get_task_allow_ref);
+        vsegment seg = _vmem->segmentForLoc(get_task_allow_ref);
+        if (seg.segname() == "__TEXT") continue; //why is this even executable??
+
+        
+        find_func = find_bof(get_task_allow_ref);
+        vmem iter(*_vmem,find_func);
+        
+        int adrpCnt = 0;
+        
+        while (++iter != insn::ret && adrpCnt < 2) {
+            if (iter() == insn::adrp) adrpCnt++;
+            if (iter() == insn::adr) adrpCnt++;
+        }
+        if (iter() == insn::ret) break;
+    }
+    debug("find_func=%p\n",find_func);
+
+        
+    loc_t funcref = find_call_ref(find_func);
+    debug("funcref=%p\n",funcref);
+    
+    vmem iter(*_vmem,funcref);
+    --iter;
+    assure(iter().rd() == 0);
+
+    loc_t p1 = iter;
+    debug("p1=%p\n",p1);
+    
+    /*
+    movn       x0, #0xf000, lsl #48
+    str        x0, [x1]
+     */
+    constexpr char patch[] = "\x00\x00\xFE\x92\x20\x00\x00\xF9";
+
+    patches.push_back({p1,patch,sizeof(patch)-1});
+
+    return patches;
+};
+
+std::vector<patch> kernelpatchfinder64::get_apfs_snapshot_patch(){
+    std::vector<patch> patches;
+
+    loc_t os_update_str = findstr("com.apple.os.update-",true);
+    debug("os_update_str=%p\n",os_update_str);
+    
+    patches.push_back({os_update_str,"x",1});
+
+    
+//    //apfs_snap_vnop_rename patch
+//    
+//    loc_t apfs_snap_vnop_rename_str = findstr("apfs_snap_vnop_rename",true);
+//    debug("apfs_snap_vnop_rename_str=%p\n",apfs_snap_vnop_rename_str);
+//
+//    loc_t apfs_snap_vnop_rename_ref = find_literal_ref(apfs_snap_vnop_rename_str);
+//    debug("apfs_snap_vnop_rename_ref=%p\n",apfs_snap_vnop_rename_ref);
+//
+//    vmem iter(*_vmem,apfs_snap_vnop_rename_ref);
+//    
+//    while (--iter != insn::tbnz || iter().imm() != 6);
+//    
+//    constexpr char patch_nop[] = "\x1F\x20\x03\xD5";
+//    patches.push_back({iter,patch_nop,sizeof(patch_nop)-1});
+    
+    return patches;
+}
+
 
 
 //#pragma mark patchfinder64

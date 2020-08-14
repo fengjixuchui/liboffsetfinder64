@@ -7,8 +7,8 @@
 //
 
 #include <iostream>
-#include <liboffsetfinder64/kernelpatchfinder64.hpp>
-#include <liboffsetfinder64/ibootpatchfinder64.hpp>
+#include "kernelpatchfinder64iOS13.hpp"
+#include "ibootpatchfinder64.hpp"
 
 using namespace std;
 using namespace tihmstar::offsetfinder64;
@@ -16,30 +16,25 @@ typedef uint64_t kptr_t;
 
 
 int main(int argc, const char * argv[]) {
+
+    ibootpatchfinder64 *ibpf = tihmstar::offsetfinder64::ibootpatchfinder64::make_ibootpatchfinder64(argv[1]);
+    cleanup([&]{
+        delete ibpf;
+    });
     
-    ibootpatchfinder64 ibp(argv[1]);
+//    auto asd = ibpf->get_boot_arg_patch("-v serial=3");
+//
+//    loc_t dsa = ibpf->find_iBoot_logstr(0xdce7b01f6ef60a3);
 
-    auto aaa = ibp.get_sigcheck_patch();
+    auto patches = ibpf->get_rw_and_x_mappings_patch_el1();
     
-    auto patches = ibp.replace_bgcolor_with_memcpy();
-
-    auto asd = ibp.get_ra1nra1n_patch();
-
     for (auto p : patches) {
-        printf("iBEC: Applying patch=%p : ",(void*)p._location);
+        printf(": Applying patch=%p : ",(void*)p._location);
         for (int i=0; i<p._patchSize; i++) {
             printf("%02x",((uint8_t*)p._patch)[i]);
         }
         printf("\n");
     }
-  
-    
-//    kernelpatchfinder64 kpf(argv[1]);
-//    
-//    auto patches = kpf.get_disable_codesigning_patch();
-    
-    
-    
     
     printf("done\n");
     return 0;

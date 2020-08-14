@@ -6,15 +6,17 @@
 //  Copyright © 2018 tihmstar. All rights reserved.
 //
 
-#include "patchfinder64.hpp"
+#include <string.h>
 
 #include <libgeneral/macros.h>
+
 #include "all_liboffsetfinder.hpp"
-#include <string.h>
+#include "patchfinder64.hpp"
 
 using namespace std;
 using namespace tihmstar;
 using namespace offsetfinder64;
+using namespace libinsn;
 
 #pragma mark liboffsetfinder
 
@@ -70,6 +72,13 @@ loc_t patchfinder64::find_bof(loc_t pos){
     } catch (...) {
         //
     }
+
+    try {
+        //there might be a pacibsp
+        if (--functop != insn::pacibsp) ++functop;
+    } catch (...) {
+        //
+    }
     
     return functop;
 }
@@ -88,29 +97,32 @@ uint64_t patchfinder64::find_register_value(loc_t where, int reg, loc_t startAdd
     
     for (;(loc_t)functop.pc() < where;++functop) {
         switch (functop().type()) {
-            case offsetfinder64::insn::adrp:
+            case insn::adrp:
                 value[functop().rd()] = functop().imm();
                 //                printf("%p: ADRP X%d, 0x%llx\n", (void*)functop.pc(), functop.rd(), functop.imm());
                 break;
-            case offsetfinder64::insn::add:
+            case insn::add:
                 value[functop().rd()] = value[functop().rn()] + functop().imm();
                 //                printf("%p: ADD X%d, X%d, 0x%llx\n", (void*)functop.pc(), functop.rd(), functop.rn(), (uint64_t)functop.imm());
                 break;
-            case offsetfinder64::insn::adr:
+            case insn::adr:
                 value[functop().rd()] = functop().imm();
                 //                printf("%p: ADR X%d, 0x%llx\n", (void*)functop.pc(), functop.rd(), functop.imm());
                 break;
-            case offsetfinder64::insn::ldr:
+            case insn::ldr:
                 //                printf("%p: LDR X%d, [X%d, 0x%llx]\n", (void*)functop.pc(), functop.rt(), functop.rn(), (uint64_t)functop.imm());
-                value[functop().rt()] = value[functop().rn()] + functop().imm(); // XXX address, not actual value
+                value[functop().rt()] = value[functop().rn()];
+                if (functop().subtype() == insn::st_immediate) {
+                    value[functop().rt()] += functop().imm(); // XXX address, not actual value
+                }
                 break;
-            case offsetfinder64::insn::movz:
+            case insn::movz:
                 value[functop().rd()] = functop().imm();
                 break;
-            case offsetfinder64::insn::movk:
+            case insn::movk:
                 value[functop().rd()] |= functop().imm();
                 break;
-            case offsetfinder64::insn::mov:
+            case insn::mov:
                 value[functop().rd()] = value[functop().rm()];
                 break;
             default:
@@ -120,8 +132,8 @@ uint64_t patchfinder64::find_register_value(loc_t where, int reg, loc_t startAdd
     return value[reg];
 }
 
-loc_t patchfinder64::find_literal_ref(loc_t pos, int ignoreTimes){
-    vmem adrp(*_vmem);
+loc_t patchfinder64::find_literal_ref(loc_t pos, int ignoreTimes, loc_t startPos){
+    vmem adrp(*_vmem, startPos);
     
     try {
         for (;;++adrp){
@@ -237,5 +249,139 @@ loc_t patchfinder64::find_branch_ref(loc_t pos, int limit, int ignoreTimes){
     }
     reterror("branchref not found");
 }
+
+loc_t patchfinder64::findnops(uint16_t nopCnt, bool useNops){
+    uint32_t *needle = NULL;
+    cleanup([&]{
+        safeFree(needle);
+    });
+    loc_t pos = 0;
+    needle = (uint32_t *)malloc(nopCnt*4);
+    
+    for (uint16_t i=0; i<nopCnt; i++) {
+        needle[i] = *(uint32_t*)"\x1F\x20\x03\xD5";
+    }
+
+    
+    pos = -4;
+nextNops:
+    pos = _vmem->memmem(needle, nopCnt*4,pos+4);
+    std::pair<loc_t, loc_t> range(pos,pos+4*nopCnt);
+    
+    for (auto &r : _usedNops) {
+        if (r.first > range.first && r.first < range.second) goto nextNops; //used range inside found range
+        if (range.first > r.first && range.first < r.second) goto nextNops; //found range inside used range
+    }
+
+    if (useNops) {
+        _usedNops.push_back(range);
+    }
+    
+    return pos;
+}
+
+uint32_t patchfinder64::pageshit_for_pagesize(uint32_t pagesize){
+    uint32_t pageshift = 0;
+    while (pagesize>>=1) pageshift++;
+    return pageshift;
+}
+
+
+uint64_t patchfinder64::pte_vma_to_index(uint32_t pagesize, uint8_t level, uint64_t address){
+    switch (pagesize) {
+        case 0x1000: //4K
+            switch (level) {
+                case 0:
+                    return BIT_RANGE(address, 39, 47);
+                case 1:
+                    return BIT_RANGE(address, 30, 38);
+                case 2:
+                    return BIT_RANGE(address, 21, 29);
+                case 3:
+                    return BIT_RANGE(address, 12, 20);
+                default:
+                    reterror("[4K] bad level=%d",level);
+            }
+            break;
+        case 0x4000: //16K
+            switch (level) {
+                case 0:
+                    return BIT_AT(address, 47);
+                case 1:
+                    return BIT_RANGE(address, 36, 46);
+                case 2:
+                    return BIT_RANGE(address, 25, 35);
+                case 3:
+                    return BIT_RANGE(address, 14, 24);
+                default:
+                    reterror("[16K] bad level=%d",level);
+            }
+            break;
+        case 0x10000: //64K
+            switch (level) {
+                case 1:
+                    return BIT_RANGE(address, 42, 51);
+                case 2:
+                    return BIT_RANGE(address, 29, 41);
+                case 3:
+                    return BIT_RANGE(address, 16, 28);
+                default:
+                    reterror("[64K] bad level=%d",level);
+            }
+            break;
+        default:
+            reterror("bad pagesize");
+    }
+}
+
+uint64_t patchfinder64::pte_index_to_vma(uint32_t pagesize, uint8_t level, uint64_t index){
+    switch (pagesize) {
+        case 0x1000: //4K
+            switch (level) {
+                case 0:
+                    return (index << 39) & ((1UL<<(47+1))-1);
+                case 1:
+                    return (index << 30) & ((1UL<<(38+1))-1);
+                case 2:
+                    return (index << 21) & ((1UL<<(29+1))-1);
+                case 3:
+                    return (index << 12) & ((1UL<<(20+1))-1);
+                default:
+                    reterror("[4K] bad level=%d",level);
+            }
+            break;
+        case 0x4000: //16K
+            switch (level) {
+                case 0:
+                    return (index << 47) & ((1UL<<(47+1))-1);
+                case 1:
+                    return (index << 36) & ((1UL<<(46+1))-1);
+                case 2:
+                    return (index << 25) & ((1UL<<(35+1))-1);
+                case 3:
+                    return (index << 14) & ((1UL<<(24+1))-1);
+                default:
+                    reterror("[16K] bad level=%d",level);
+            }
+            break;
+        case 0x10000: //64K
+            switch (level) {
+                case 1:
+                    return (index << 42) & ((1UL<<(51+1))-1);
+                case 2:
+                    return (index << 29) & ((1UL<<(41+1))-1);
+                case 3:
+                    return (index << 16) & ((1UL<<(28+1))-1);
+                default:
+                    reterror("[64K] bad level=%d",level);
+            }
+            break;
+        default:
+            reterror("bad pagesize");
+    }
+}
+
+
+
 
 //

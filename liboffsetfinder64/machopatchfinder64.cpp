@@ -6,9 +6,7 @@
 //  Copyright © 2019 tihmstar. All rights reserved.
 //
 
-#include <libgeneral/macros.h>
 
-#include "machopatchfinder64.hpp"
 #include <stdio.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -18,13 +16,17 @@
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 
-
 #include <libgeneral/macros.h>
+#include <libinsn/vsegment.hpp>
+
 #ifdef HAVE_IMG4TOOL
 #include <img4tool/img4tool.hpp>
 #endif //HAVE_IMG4TOOL
 
+#include "machopatchfinder64.hpp"
+
 using namespace tihmstar::offsetfinder64;
+using namespace tihmstar::libinsn;
 
 #pragma mark macho external
 
@@ -73,13 +75,13 @@ __attribute__((always_inline)) struct symtab_command *machopatchfinder64::getSym
 }
 
 void machopatchfinder64::loadSegments(){
-    std::vector<offsetfinder64::vsegment> segments;
+    std::vector<vsegment> segments;
     struct mach_header_64 *mh = (struct mach_header_64*)_buf;
     struct load_command *lcmd = (struct load_command *)(mh + 1);
     for (uint32_t i=0; i<mh->ncmds; i++, lcmd = (struct load_command *)((uint8_t *)lcmd + lcmd->cmdsize)) {
         if (lcmd->cmd == LC_SEGMENT_64){
             struct segment_command_64* seg = (struct segment_command_64*)lcmd;
-            segments.push_back({_buf+seg->fileoff,seg->filesize, (loc_t)seg->vmaddr, seg->maxprot});
+            segments.push_back({_buf+seg->fileoff,seg->filesize, (loc_t)seg->vmaddr, seg->maxprot, seg->segname});
             if (i==0){
                 _base = (loc_t)seg->vmaddr; //first segment is base. Is this correct??
             }
@@ -161,7 +163,10 @@ void machopatchfinder64::init(){
     
         if (tryfat) {
             printf("got fat macho with first slice at %u\n", (uint32_t) (tryfat - _buf));
-            free((void*)_buf);
+            if (_freeBuf) {
+                free((void*)_buf);
+            }
+            _freeBuf = true;
             _buf = tryfat;tryfat = NULL;
         } else {
             printf("got fat macho but failed to parse\n");
